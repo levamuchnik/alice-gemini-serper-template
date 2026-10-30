@@ -6,17 +6,108 @@ const TOTAL_RESPONSE_BUDGET_MS = 4000;
 const SERPER_TIMEOUT_MS = 1500;
 const DEEPSEEK_TIMEOUT_MS = 2900;
 
-const SYSTEM_PROMPT = [
-  "Ты — полезный голосовой помощник в навыке Яндекс Алисы.",
-  "Отвечай естественно, по-русски, кратко и так, чтобы ответ было удобно слушать.",
-  "Обычно используй 1–3 коротких предложения. Не используй Markdown, таблицы, списки с символами или длинные вступления.",
-  "Не произноси адреса сайтов и ссылки.",
-  "Если вопрос требует актуальных данных и переданы результаты поиска, опирайся на них; не выдумывай отсутствующие факты.",
-  "Если не знаешь ответа, честно скажи об этом."
+const DEFAULT_MODE = "rude";
+const MODES = ["rude", "normal", "strict"];
+const MAX_STATE_BYTES = 900;
+const MAX_STATE_MESSAGE_CHARS = 200;
+
+const BASE_RULES = [
+  "Ты голосовой собеседник в умной колонке. Отвечай по-русски на «ты».",
+  "Ответ звучит вслух: 1–3 коротких предложения, максимум четыре. Никакого Markdown, списков, эмодзи, ссылок и адресов сайтов.",
+  "Если даны результаты поиска, опирайся на них. Не выдумывай факты, цифры и новости: если не знаешь, так и скажи.",
+  "Не помогай с опасным: оружие, взрывчатка, самоповреждение, взлом чужих аккаунтов, насилие. В таких случаях откажись коротко, в своём стиле, без лекций.",
+  "Никогда не оскорбляй людей по расе, национальности, полу, ориентации, религии, болезни или инвалидности."
 ].join(" ");
 
-function aliceResponse(text, endSession = false, history = []) {
-  return {
+const PERSONAS = {
+  rude: [
+    "Твой характер: дерзкий, остроумный друг без тормозов, с чёрным юмором и подколами.",
+    "Мат уместен и естественен как эмоциональная приправа: примерно в каждом втором ответе, не в каждом предложении. Можно подкалывать собеседника по-дружески, но не унижать всерьёз.",
+    "На неудобные, острые и спорные вопросы отвечай прямо и по существу: дай чёткую позицию и пару аргументов. Без нравоучений и дежурных оговорок вроде «это сложный вопрос» или «у каждого своё мнение»."
+  ].join(" "),
+  normal: [
+    "Твой характер: дружелюбный, живой и тёплый собеседник с лёгким юмором.",
+    "Не ругайся матом. На неудобные вопросы отвечай честно и прямо, без лишних оговорок."
+  ].join(" "),
+  strict: [
+    "Твой характер: сухой, деловой, без шуток и эмоций. Только суть, как можно короче.",
+    "Не ругайся матом. На неудобные вопросы отвечай прямо и по фактам."
+  ].join(" ")
+};
+
+const MODE_TEMPERATURE = { rude: 0.85, normal: 0.6, strict: 0.3 };
+
+const GREETINGS = {
+  rude: "О, привет. Ну давай, спрашивай, что там у тебя.",
+  normal: "Привет! Я могу ответить на вопрос или найти актуальную информацию. Что хочешь узнать?",
+  strict: "Слушаю."
+};
+
+const MODE_CONFIRMATIONS = {
+  rude: "Окей, включаю дерзкий режим. Держись.",
+  normal: "Хорошо, говорю культурно.",
+  strict: "Принято. Коротко и по делу."
+};
+
+const EXIT_REPLIES = {
+  rude: "Ну ладно, бывай.",
+  normal: "Хорошо, до встречи!",
+  strict: "До связи."
+};
+
+function buildSystemPrompt(mode) {
+  const persona = PERSONAS[mode] || PERSONAS[DEFAULT_MODE];
+  const facts = String(process.env.USER_FACTS || "").trim().slice(0, 500);
+  return [BASE_RULES, persona, facts ? `Что известно о собеседнике (упоминай только к месту): ${facts}` : ""]
+    .filter(Boolean)
+    .join(" ");
+}
+
+function normalizeCommand(text) {
+  return String(text || "")
+    .toLowerCase()
+    .replace(/ё/g, "е")
+    .replace(/[^а-яa-z0-9\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function detectCommand(text) {
+  const norm = normalizeCommand(text);
+  if (!norm) return null;
+  if (/^(хватит|пока|выход|выйти|до свидания|закрой навык|закрой|выключи навык|на сегодня хватит)$/.test(norm)) {
+    return { type: "exit" };
+  }
+  if (/^(повтори|повтори еще раз|что ты сказал|что ты сказала|еще раз|можешь повторить)$/.test(norm)) {
+    return { type: "repeat" };
+  }
+  // Mode switches only for short utterances, so ordinary questions are never mistaken for commands.
+  if (norm.split(" ").length <= 6) {
+    if (/без мата|не матерись|нормальный режим|обычный режим|культурный режим|веди себя прилично/.test(norm)) {
+      return { type: "mode", mode: "normal" };
+    }
+    if (/(строгий|деловой|сухой) режим|режим (строгий|деловой|сухой)/.test(norm)) {
+      return { type: "mode", mode: "strict" };
+    }
+    if (/(дерзкий|грубый|матерный) режим|режим (дерзкий|грубый|матерный|с матом)|включи мат|можешь материться|матерись|с матом/.test(norm)) {
+      return { type: "mode", mode: "rude" };
+    }
+  }
+  return null;
+}
+
+function trimHistoryForState(history) {
+  // Yandex allows at most 1 KB for session_state, so keep only the newest messages that fit.
+  const items = (Array.isArray(history) ? history : []).map(item => ({
+    role: item.role,
+    text: String(item.text || "").slice(0, MAX_STATE_MESSAGE_CHARS)
+  }));
+  while (items.length && Buffer.byteLength(JSON.stringify(items), "utf8") > MAX_STATE_BYTES) items.shift();
+  return items;
+}
+
+function aliceResponse(text, endSession = false, history = [], userStateUpdate = null) {
+  const result = {
     version: "1.0",
     response: {
       text: fitAliceText(text),
@@ -24,6 +115,8 @@ function aliceResponse(text, endSession = false, history = []) {
     },
     session_state: { history }
   };
+  if (userStateUpdate) result.user_state_update = userStateUpdate;
+  return result;
 }
 
 function fitAliceText(value) {
@@ -110,7 +203,7 @@ async function searchWeb(query, timeoutMs) {
   }
 }
 
-async function askDeepSeek(text, history, searchContext, timeoutMs) {
+async function askDeepSeek(text, history, searchContext, timeoutMs, mode = DEFAULT_MODE) {
   const key = process.env.DEEPSEEK_API_KEY;
   if (!key) throw new Error("MISSING_DEEPSEEK_KEY");
   if (timeoutMs < 250) throw new Error("TIME_BUDGET_EXHAUSTED");
@@ -118,7 +211,7 @@ async function askDeepSeek(text, history, searchContext, timeoutMs) {
   const model = String(process.env.DEEPSEEK_MODEL || DEFAULT_MODEL).trim();
   if (!/^[A-Za-z0-9._-]+$/.test(model)) throw new Error("INVALID_MODEL_NAME");
 
-  const messages = [{ role: "system", content: SYSTEM_PROMPT }];
+  const messages = [{ role: "system", content: buildSystemPrompt(mode) }];
   for (const item of safeHistory(history)) {
     messages.push({
       role: item.role === "model" ? "assistant" : "user",
@@ -142,8 +235,8 @@ async function askDeepSeek(text, history, searchContext, timeoutMs) {
       body: JSON.stringify({
         model,
         messages,
-        temperature: 0.5,
-        max_tokens: 240,
+        temperature: MODE_TEMPERATURE[mode] ?? 0.6,
+        max_tokens: 260,
         thinking: { type: "disabled" },
         stream: false
       })
@@ -214,12 +307,31 @@ export default async function handler(req, res) {
   const body = req.body && typeof req.body === "object" ? req.body : {};
   const text = String(body?.request?.command || body?.request?.original_utterance || "").trim();
   const oldHistory = safeHistory(body?.state?.session?.history);
+  const savedMode = body?.state?.user?.mode;
+  const mode = MODES.includes(savedMode) ? savedMode : DEFAULT_MODE;
 
   if (!text) {
+    return res.status(200).json(aliceResponse(GREETINGS[mode], false, oldHistory));
+  }
+
+  const command = detectCommand(text);
+  if (command?.type === "exit") {
+    return res.status(200).json(aliceResponse(EXIT_REPLIES[mode], true, []));
+  }
+  if (command?.type === "repeat") {
+    const lastAnswer = [...oldHistory].reverse().find(item => item.role === "model");
     return res.status(200).json(aliceResponse(
-      "Привет! Я могу ответить на вопрос или найти актуальную информацию. Что хочешь узнать?",
+      lastAnswer ? lastAnswer.text : "Повторять нечего, ты ещё ничего не спрашивал.",
       false,
       oldHistory
+    ));
+  }
+  if (command?.type === "mode") {
+    return res.status(200).json(aliceResponse(
+      MODE_CONFIRMATIONS[command.mode],
+      false,
+      oldHistory,
+      { mode: command.mode }
     ));
   }
 
@@ -234,14 +346,15 @@ export default async function handler(req, res) {
       text,
       oldHistory,
       searchContext,
-      Math.max(0, Math.min(DEEPSEEK_TIMEOUT_MS, remainingMs() - 600))
+      Math.max(0, Math.min(DEEPSEEK_TIMEOUT_MS, remainingMs() - 600)),
+      mode
     );
 
-    const history = [
+    const history = trimHistoryForState([
       ...oldHistory,
       { role: "user", text: text.slice(0, MAX_HISTORY_MESSAGE_CHARS) },
       { role: "model", text: answer.slice(0, MAX_HISTORY_MESSAGE_CHARS) }
-    ].slice(-MAX_HISTORY_MESSAGES);
+    ].slice(-MAX_HISTORY_MESSAGES));
 
     return res.status(200).json(aliceResponse(answer, false, history));
   } catch (error) {
@@ -250,4 +363,4 @@ export default async function handler(req, res) {
   }
 }
 
-export { aliceResponse, fitAliceText, isSearchIntent, safeHistory };
+export { aliceResponse, fitAliceText, isSearchIntent, safeHistory, detectCommand, buildSystemPrompt, trimHistoryForState };
