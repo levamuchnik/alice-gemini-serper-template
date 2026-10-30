@@ -19,6 +19,14 @@ const BASE_RULES = [
   "Никогда не оскорбляй людей по расе, национальности, полу, ориентации, религии, болезни или инвалидности."
 ].join(" ");
 
+const SPEECH_RULES = [
+  "Твой текст озвучивает синтезатор речи, поэтому пиши так, как говорят вслух.",
+  "Говори живо и разговорно, как человек в беседе: можно «слушай», «ну», «короче», «в общем», частицы и вводные слова, но без канцелярита и без заготовок вроде «Конечно!» и «Отличный вопрос!». Сразу отвечай по делу, не пересказывай вопрос.",
+  "Интонацию задаёт пунктуация: короткие фразы, запятая перед «но», «а», «потому что», точка или тире там, где нужна пауза, вопросительный и восклицательный знаки там, где они уместны. Не используй скобки, кавычки, двоеточия, многоточия, повторяющиеся знаки и списки.",
+  "Числа, даты, время, деньги и единицы пиши словами в нужном падеже: «двадцать пять градусов», «пятнадцать тридцать», «три тысячи рублей», «пять процентов». Сокращения раскрывай. Иностранные слова и названия пиши русскими буквами так, как они звучат. Букву «ё» всегда пиши там, где она есть в слове.",
+  "Ударения: ставь знак «+» прямо перед ударной гласной, но только в словах, где синтезатор легко ошибается: омографы (зам+ок и з+амок, м+ука и мук+а, д+ома и дом+а), редкие слова, фамилии, имена и названия. Не ставь «+» в односложных и в обычных словах, которые читаются правильно. Не больше пяти знаков «+» на ответ. Если не уверен в ударении, не ставь его."
+].join(" ");
+
 const PERSONAS = {
   rude: [
     "Твой характер: дерзкий, остроумный друг без тормозов, с чёрным юмором и подколами.",
@@ -58,7 +66,7 @@ const EXIT_REPLIES = {
 function buildSystemPrompt(mode) {
   const persona = PERSONAS[mode] || PERSONAS[DEFAULT_MODE];
   const facts = String(process.env.USER_FACTS || "").trim().slice(0, 500);
-  return [BASE_RULES, persona, facts ? `Что известно о собеседнике (упоминай только к месту): ${facts}` : ""]
+  return [BASE_RULES, SPEECH_RULES, persona, facts ? `Что известно о собеседнике (упоминай только к месту): ${facts}` : ""]
     .filter(Boolean)
     .join(" ");
 }
@@ -106,15 +114,37 @@ function trimHistoryForState(history) {
   return items;
 }
 
-function aliceResponse(text, endSession = false, history = [], userStateUpdate = null) {
+const MAX_STRESS_MARKS = 8;
+
+// The model may mark stress with "+" before a vowel. Alice's TTS understands that mark, but the written
+// text must stay clean, so we split the answer into plain text and a separate tts string.
+function prepareSpeech(raw) {
+  let tts = String(raw ?? "")
+    .replace(/[*#_`~>|]/g, "")
+    .replace(/(\d)\s*\+\s*(\d)/g, "$1 плюс $2")
+    .replace(/\+(?![аеёиоуыэюяАЕЁИОУЫЭЮЯ])/g, "")
+    .replace(/(?<![А-Яа-яЁё])\+/g, "");
+  let marks = 0;
+  tts = tts.replace(/\+/g, () => (++marks <= MAX_STRESS_MARKS ? "+" : ""));
+  const text = tts.replace(/\+/g, "");
+  return { text, tts: marks > 0 ? tts : null };
+}
+
+function aliceResponse(text, endSession = false, history = [], userStateUpdate = null, tts = null) {
+  const fitted = fitAliceText(text);
   const result = {
     version: "1.0",
     response: {
-      text: fitAliceText(text),
+      text: fitted,
       end_session: endSession
     },
     session_state: { history }
   };
+  if (tts) {
+    const ttsFit = String(tts).replace(/[\r\n\t]+/g, " ").replace(/\s{2,}/g, " ").trim();
+    // Use the stressed version only when it is the same sentence, untruncated and within Alice's limit.
+    if (ttsFit.length <= MAX_ALICE_TEXT && ttsFit.replace(/\+/g, "") === fitted) result.response.tts = ttsFit;
+  }
   if (userStateUpdate) result.user_state_update = userStateUpdate;
   return result;
 }
@@ -149,6 +179,112 @@ function safeHistory(history) {
     .filter(item => item && (item.role === "user" || item.role === "model") && typeof item.text === "string")
     .slice(-MAX_HISTORY_MESSAGES)
     .map(item => ({ role: item.role, text: item.text.slice(0, MAX_HISTORY_MESSAGE_CHARS) }));
+}
+
+const WEATHER_TIMEOUT_MS = 1200;
+const DEFAULT_CITY_NAME = "Москва";
+
+const CITY_TAIL = "(?![а-яё])";
+const WEATHER_CITIES = [
+  { name: "Москва", re: /москв/i, lat: 55.7558, lon: 37.6173 },
+  { name: "Санкт-Петербург", re: /питер|петербург|спб/i, lat: 59.9343, lon: 30.3351 },
+  { name: "Новосибирск", re: /новосибирск/i, lat: 55.0084, lon: 82.9357 },
+  { name: "Екатеринбург", re: /екатеринбург|екб/i, lat: 56.8389, lon: 60.6057 },
+  { name: "Казань", re: /казан/i, lat: 55.7887, lon: 49.1221 },
+  { name: "Нижний Новгород", re: /нижн\S*\s+новгород/i, lat: 56.2965, lon: 43.9361 },
+  { name: "Челябинск", re: /челябинск/i, lat: 55.1644, lon: 61.4368 },
+  { name: "Самара", re: /самар/i, lat: 53.1959, lon: 50.1002 },
+  { name: "Омск", re: new RegExp("(?<![а-яё])омск" + CITY_TAIL, "i"), lat: 54.9885, lon: 73.3242 },
+  { name: "Ростов-на-Дону", re: /ростов/i, lat: 47.2357, lon: 39.7015 },
+  { name: "Уфа", re: new RegExp("(?<![а-яё])уф[аеуы]" + CITY_TAIL, "i"), lat: 54.7388, lon: 55.9721 },
+  { name: "Красноярск", re: /красноярск/i, lat: 56.0153, lon: 92.8932 },
+  { name: "Воронеж", re: /воронеж/i, lat: 51.672, lon: 39.1843 },
+  { name: "Пермь", re: /(?<![а-яё])перм[ьи]/i, lat: 58.0105, lon: 56.2502 },
+  { name: "Волгоград", re: /волгоград/i, lat: 48.708, lon: 44.5133 },
+  { name: "Краснодар", re: /краснодар/i, lat: 45.0355, lon: 38.9753 },
+  { name: "Сочи", re: /сочи/i, lat: 43.5855, lon: 39.7231 },
+  { name: "Тюмень", re: /тюмен/i, lat: 57.1522, lon: 65.5272 },
+  { name: "Саратов", re: /саратов/i, lat: 51.5336, lon: 46.0343 },
+  { name: "Тула", re: new RegExp("(?<![а-яё])тул[аеуы]" + CITY_TAIL, "i"), lat: 54.1961, lon: 37.6182 },
+  { name: "Калининград", re: /калининград/i, lat: 54.7104, lon: 20.4522 },
+  { name: "Владивосток", re: /владивосток/i, lat: 43.1155, lon: 131.8855 },
+  { name: "Минск", re: /минск/i, lat: 53.9006, lon: 27.559 }
+];
+
+function isWeatherIntent(text) {
+  return /погод|прогноз|градус|температур|дожд|ливень|гроз[аыуе]|снег|зонт|холодно|на улице/i.test(String(text || ""));
+}
+
+function findCity(text) {
+  const found = WEATHER_CITIES.find(city => city.re.test(String(text || "")));
+  if (found) return { city: found, matched: true };
+  const wanted = String(process.env.DEFAULT_CITY || DEFAULT_CITY_NAME).trim().toLowerCase();
+  const fallback = WEATHER_CITIES.find(city => city.name.toLowerCase() === wanted) || WEATHER_CITIES[0];
+  return { city: fallback, matched: false };
+}
+
+function weatherCodeToText(code) {
+  const c = Number(code);
+  if (c === 0) return "ясно";
+  if (c === 1) return "в основном ясно";
+  if (c === 2) return "переменная облачность";
+  if (c === 3) return "пасмурно";
+  if (c === 45 || c === 48) return "туман";
+  if (c >= 51 && c <= 57) return "морось";
+  if (c >= 61 && c <= 65) return "дождь";
+  if (c === 66 || c === 67) return "ледяной дождь";
+  if (c >= 71 && c <= 77) return "снег";
+  if (c >= 80 && c <= 82) return "ливень";
+  if (c === 85 || c === 86) return "снегопад";
+  if (c >= 95) return "гроза";
+  return "без особенностей";
+}
+
+function tempWords(value) {
+  const n = Math.round(Number(value));
+  if (!Number.isFinite(n)) return "нет данных";
+  if (n > 0) return `плюс ${n}`;
+  if (n < 0) return `минус ${-n}`;
+  return "ноль";
+}
+
+function buildWeatherContext(data, cityName) {
+  const cur = data?.current;
+  const daily = data?.daily;
+  if (!cur || !daily || !Array.isArray(daily.time)) return "";
+  const labels = ["сегодня", "завтра", "послезавтра", "через три дня"];
+  const lines = [
+    `Город: ${cityName}.`,
+    `Сейчас: ${tempWords(cur.temperature_2m)}, ощущается как ${tempWords(cur.apparent_temperature)}, ${weatherCodeToText(cur.weather_code)}, ветер ${Math.round(Number(cur.wind_speed_10m) || 0)} метров в секунду.`
+  ];
+  daily.time.slice(0, labels.length).forEach((_, i) => {
+    const prob = daily.precipitation_probability_max?.[i];
+    lines.push(
+      `${labels[i][0].toUpperCase()}${labels[i].slice(1)}: от ${tempWords(daily.temperature_2m_min?.[i])} до ${tempWords(daily.temperature_2m_max?.[i])}, ${weatherCodeToText(daily.weather_code?.[i])}` +
+      (Number.isFinite(prob) ? `, вероятность осадков ${Math.round(prob)} процентов.` : ".")
+    );
+  });
+  return lines.join("\n");
+}
+
+async function getWeatherContext(city, timeoutMs) {
+  if (timeoutMs < 200) return "";
+  try {
+    const url = "https://api.open-meteo.com/v1/forecast" +
+      `?latitude=${city.lat}&longitude=${city.lon}` +
+      "&current=temperature_2m,apparent_temperature,weather_code,wind_speed_10m" +
+      "&daily=temperature_2m_max,temperature_2m_min,weather_code,precipitation_probability_max" +
+      "&timezone=auto&forecast_days=4&wind_speed_unit=ms";
+    const { response, data } = await fetchJson(url, { method: "GET" }, Math.min(WEATHER_TIMEOUT_MS, timeoutMs));
+    if (!response.ok) {
+      console.warn("Weather request failed with HTTP", response.status);
+      return "";
+    }
+    return buildWeatherContext(data, city.name);
+  } catch (error) {
+    console.warn("Weather request did not finish in time; continuing without it.");
+    return "";
+  }
 }
 
 async function fetchJson(url, options, timeoutMs) {
@@ -203,7 +339,7 @@ async function searchWeb(query, timeoutMs) {
   }
 }
 
-async function askDeepSeek(text, history, searchContext, timeoutMs, mode = DEFAULT_MODE) {
+async function askDeepSeek(text, history, searchContext, timeoutMs, mode = DEFAULT_MODE, weather = null) {
   const key = process.env.DEEPSEEK_API_KEY;
   if (!key) throw new Error("MISSING_DEEPSEEK_KEY");
   if (timeoutMs < 250) throw new Error("TIME_BUDGET_EXHAUSTED");
@@ -219,9 +355,18 @@ async function askDeepSeek(text, history, searchContext, timeoutMs, mode = DEFAU
     });
   }
 
-  const prompt = searchContext
-    ? `${text}\n\nРезультаты поиска в интернете:\n${searchContext}\nИспользуй их только там, где они относятся к вопросу.`
-    : text;
+  let prompt = text;
+  if (weather?.context) {
+    prompt += `\n\nТочные данные о погоде из метеосервиса:\n${weather.context}\n` +
+      "Ответь по этим данным коротко и по делу: сразу скажи температуру и что за погода, при необходимости добавь совет по одежде или зонту. " +
+      "Не отправляй в приложение и не говори, что не знаешь погоду. " +
+      (weather.matched
+        ? ""
+        : "Город в вопросе не назван, поэтому взят город по умолчанию, просто назови его в ответе. Если пользователь явно спрашивал про другой город, которого нет в данных, честно скажи, что по нему данных нет. ") +
+      "Числа пиши словами.";
+  } else if (searchContext) {
+    prompt += `\n\nРезультаты поиска в интернете:\n${searchContext}\nИспользуй их только там, где они относятся к вопросу.`;
+  }
   messages.push({ role: "user", content: prompt });
 
   const { response, data } = await fetchJson(
@@ -337,7 +482,13 @@ export default async function handler(req, res) {
 
   try {
     let searchContext = "";
-    if (isSearchIntent(text) && process.env.SERPER_API_KEY) {
+    let weather = null;
+    if (isWeatherIntent(text)) {
+      const { city, matched } = findCity(text);
+      const context = await getWeatherContext(city, Math.min(WEATHER_TIMEOUT_MS, Math.max(0, remainingMs() - 2000)));
+      if (context) weather = { context, matched };
+    }
+    if (!weather && isSearchIntent(text) && process.env.SERPER_API_KEY) {
       // Search gets a very short budget: Alice expects a response within about 4.5 seconds.
       searchContext = await searchWeb(text, Math.min(SERPER_TIMEOUT_MS, Math.max(0, remainingMs() - 2000)));
     }
@@ -347,20 +498,22 @@ export default async function handler(req, res) {
       oldHistory,
       searchContext,
       Math.max(0, Math.min(DEEPSEEK_TIMEOUT_MS, remainingMs() - 600)),
-      mode
+      mode,
+      weather
     );
 
+    const speech = prepareSpeech(answer);
     const history = trimHistoryForState([
       ...oldHistory,
       { role: "user", text: text.slice(0, MAX_HISTORY_MESSAGE_CHARS) },
-      { role: "model", text: answer.slice(0, MAX_HISTORY_MESSAGE_CHARS) }
+      { role: "model", text: speech.text.slice(0, MAX_HISTORY_MESSAGE_CHARS) }
     ].slice(-MAX_HISTORY_MESSAGES));
 
-    return res.status(200).json(aliceResponse(answer, false, history));
+    return res.status(200).json(aliceResponse(speech.text, false, history, null, speech.tts));
   } catch (error) {
     console.warn("Alice webhook returned a fallback response:", error?.name === "AbortError" ? "timeout" : error?.message || "unknown error");
     return res.status(200).json(aliceResponse(errorForUser(error), false, oldHistory));
   }
 }
 
-export { aliceResponse, fitAliceText, isSearchIntent, safeHistory, detectCommand, buildSystemPrompt, trimHistoryForState };
+export { aliceResponse, fitAliceText, isSearchIntent, safeHistory, detectCommand, buildSystemPrompt, trimHistoryForState, prepareSpeech, isWeatherIntent, findCity, buildWeatherContext, weatherCodeToText };
