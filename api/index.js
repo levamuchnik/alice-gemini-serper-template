@@ -1,4 +1,4 @@
-const DEFAULT_MODEL = "deepseek-chat";
+const DEFAULT_MODEL = "deepseek-flash";
 const MAX_HISTORY_MESSAGES = 8;
 const MAX_HISTORY_MESSAGE_CHARS = 1200;
 const MAX_ALICE_TEXT = 1024;
@@ -144,6 +144,7 @@ async function askDeepSeek(text, history, searchContext, timeoutMs) {
         messages,
         temperature: 0.5,
         max_tokens: 240,
+        thinking: { type: "disabled" },
         stream: false
       })
     },
