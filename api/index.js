@@ -3,7 +3,7 @@ const MAX_HISTORY_MESSAGES = 8;
 const MAX_HISTORY_MESSAGE_CHARS = 1200;
 const MAX_ALICE_TEXT = 1024;
 const TOTAL_RESPONSE_BUDGET_MS = 4000;
-const SERPER_TIMEOUT_MS = 600;
+const SERPER_TIMEOUT_MS = 1500;
 const DEEPSEEK_TIMEOUT_MS = 2900;
 
 const SYSTEM_PROMPT = [
@@ -227,7 +227,7 @@ export default async function handler(req, res) {
     let searchContext = "";
     if (isSearchIntent(text) && process.env.SERPER_API_KEY) {
       // Search gets a very short budget: Alice expects a response within about 4.5 seconds.
-      searchContext = await searchWeb(text, Math.min(SERPER_TIMEOUT_MS, Math.max(0, remainingMs() - DEEPSEEK_TIMEOUT_MS)));
+      searchContext = await searchWeb(text, Math.min(SERPER_TIMEOUT_MS, Math.max(0, remainingMs() - 2000)));
     }
 
     const answer = await askDeepSeek(
